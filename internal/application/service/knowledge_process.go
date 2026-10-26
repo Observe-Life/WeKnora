@@ -712,8 +712,15 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 			return abortRetryErr(ctx, knowledge.ID, status)
 		}
 
-		err = retrieveEngine.BatchIndex(ctx, embeddingModel, indexInfoList)
+		// per-call watchdog: a hanging embedding provider call pauses the lane
+		// instead of holding a worker slot open indefinitely.
+		embedCtx, embedCancel := context.WithTimeout(ctx, wikiWatchdogCallTimeout)
+		err = retrieveEngine.BatchIndex(embedCtx, embeddingModel, indexInfoList)
+		embedCancel()
 		if err != nil {
+			if isWatchdogAbortError(err) && ctx.Err() == nil {
+				logger.GetLogger(ctx).Warnf("vector model watchdog tripped (hung call or hard auth/quota error): vector lane paused, queued jobs preserved: %v", err)
+			}
 			knowledge.ParseStatus = types.ParseStatusFailed
 			knowledge.ErrorMessage = err.Error()
 			knowledge.UpdatedAt = time.Now()

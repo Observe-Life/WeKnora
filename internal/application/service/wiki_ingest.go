@@ -143,6 +143,11 @@ return proposed
 	// gives the per-minute window time to reset before we try again.
 	wikiRateLimitBackoff = 60 * time.Second
 
+	// model watchdog: a call hanging this long, or one hard auth/quota
+	// error, pauses the model lane instead of grinding on.
+	wikiWatchdogCallTimeout = 5 * time.Minute
+	wikiWatchdogBackoff     = 10 * time.Minute
+
 	// wikiMaxDocsPerBatch limits how many documents a single batch processes.
 	// Prevents unbounded execution time. Remaining ops stay in
 	// task_pending_ops and are picked up by the follow-up task.
@@ -2745,7 +2750,13 @@ func (s *wikiIngestService) generateWithTemplateResult(
 		call := func(msgs []chat.Message) (*types.ChatResponse, error) {
 			var lastErr error
 			for attempt := 1; attempt <= wikiLLMMaxAttempts; attempt++ {
-				response, callErr := chatModel.Chat(ctx, msgs, opts)
+				// per-call watchdog: a hanging provider call must not hold the lane
+				callCtx, callCancel := context.WithTimeout(ctx, wikiWatchdogCallTimeout)
+				response, callErr := chatModel.Chat(callCtx, msgs, opts)
+				callCancel()
+				if callErr != nil && ctx.Err() == nil && strings.Contains(callErr.Error(), "context deadline exceeded") {
+					return nil, fmt.Errorf("LLM call failed (model watchdog): wiki llm call timeout after %s: %v", wikiWatchdogCallTimeout, callErr)
+				}
 				if callErr == nil && response != nil {
 					return response, nil
 				}
@@ -2911,6 +2922,43 @@ func (s *wikiIngestService) awaitWikiPromptWarmup(ctx context.Context, key strin
 	}
 }
 
+// hardModelErrorIndicators mark provider failures that will not heal on
+// retry: exhausted quota, invalid credentials, authorization rejections.
+// One occurrence should trip the model watchdog so the lane stops re-issuing
+// the same doomed request and waits for the operator to fix the cause.
+var hardModelErrorIndicators = []string{
+	"insufficient_quota",
+	"insufficient balance",
+	"quota exceeded",
+	"invalid api key",
+	"invalid_api_key",
+	"unauthorized",
+	"not authorized",
+	"billing",
+	"status 401",
+	"status 402",
+	"payment required",
+}
+
+// isWatchdogAbortError reports whether a model-call failure should trip the
+// model watchdog: an explicit per-call timeout marker, or a hard auth/quota
+// error. Rate limits are classified separately by isLikelyRateLimitError.
+func isWatchdogAbortError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "wiki llm call timeout") || strings.Contains(msg, "model watchdog") {
+		return true
+	}
+	for _, s := range hardModelErrorIndicators {
+		if strings.Contains(msg, s) {
+			return true
+		}
+	}
+	return false
+}
+
 // isTransientLLMError reports whether an error from the chat provider
 // looks like an infrastructure hiccup worth retrying. Classification is
 // intentionally conservative: the truthful "could not tell, assume
@@ -3033,6 +3081,38 @@ func (s *wikiIngestService) isKnowledgeGone(ctx context.Context, kbID, knowledge
 	}
 	return false
 }
+
+// dropDeadSourceRefs prunes source refs whose owning knowledge no longer
+// exists, immediately before a page write. It closes the last gap of the
+// ingest/delete race: the page row snapshot is loaded before the long reduce
+// LLM call, and cleanupWikiOnKnowledgeDelete may strip a ref (or delete the
+// page) while that call is in flight. Without this check the stale snapshot
+// write would resurrect the deleted doc's reference. Unknown states are
+// kept: we only drop on positive evidence that the knowledge is gone.
+func (s *wikiIngestService) dropDeadSourceRefs(ctx context.Context, kbID string, page *types.WikiPage) {
+	if page == nil || len(page.SourceRefs) == 0 {
+		return
+	}
+	kept := make(types.StringArray, 0, len(page.SourceRefs))
+	changed := false
+	for _, ref := range page.SourceRefs {
+		kid := types.WikiSourceKnowledgeID(ref)
+		if kid == "" {
+			kept = append(kept, ref)
+			continue
+		}
+		gone := s.isKnowledgeGone(ctx, kbID, kid)
+		if !gone {
+			kept = append(kept, ref)
+			continue
+		}
+		changed = true
+	}
+	if changed {
+		page.SourceRefs = kept
+	}
+}
+
 
 // filterLiveUpdates drops additions/summaries whose source knowledge has been
 // deleted since the Map phase finished. Retract updates are preserved so

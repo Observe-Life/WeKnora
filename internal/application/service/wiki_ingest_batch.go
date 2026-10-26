@@ -442,6 +442,9 @@ func (s *wikiIngestService) ProcessWikiIngest(ctx context.Context, t *asynq.Task
 	// saturated rpm budget. Guarded by mapMu (map phase) / reduceMu (reduce
 	// phase) — both are held when written.
 	rateLimited := false
+	// model watchdog trip flag (written under mapMu in the map phase,
+	// reduceMu in the reduce phase; read after both waits)
+	watchdogTripped := false
 
 	eg, mapCtx := errgroup.WithContext(ctx)
 	eg.SetLimit(mapParallel) // Map phase limit (configurable via WikiConfig)
@@ -449,6 +452,15 @@ func (s *wikiIngestService) ProcessWikiIngest(ctx context.Context, t *asynq.Task
 	for _, op := range pendingOps {
 		op := op
 		eg.Go(func() error {
+			mapMu.Lock()
+			tripped := watchdogTripped
+			if tripped {
+				failedOps = append(failedOps, op)
+			}
+			mapMu.Unlock()
+			if tripped {
+				return nil
+			}
 			if op.Op == WikiOpRetract {
 				// Resolve the authoritative page set at run-time. The caller
 				// (knowledgeService.cleanupWikiOnKnowledgeDelete) captures
@@ -535,6 +547,9 @@ func (s *wikiIngestService) ProcessWikiIngest(ctx context.Context, t *asynq.Task
 				failedOps = append(failedOps, op)
 				if isLikelyRateLimitError(err) {
 					rateLimited = true
+				}
+				if isWatchdogAbortError(err) {
+					watchdogTripped = true
 				}
 				mapMu.Unlock()
 				logger.Warnf(mapCtx, "wiki ingest: failed to map knowledge %s: %v", op.KnowledgeID, err)
@@ -642,6 +657,13 @@ func (s *wikiIngestService) ProcessWikiIngest(ctx context.Context, t *asynq.Task
 		slug := slug
 		updates := updates
 		egReduce.Go(func() error {
+			reduceMu.Lock()
+			tripped := watchdogTripped
+			reduceMu.Unlock()
+			if tripped {
+				collectUnapplied(updates)
+				return nil
+			}
 			var (
 				changed        bool
 				affectedType   string
@@ -680,6 +702,11 @@ func (s *wikiIngestService) ProcessWikiIngest(ctx context.Context, t *asynq.Task
 				if isLikelyRateLimitError(reduceErr) {
 					reduceMu.Lock()
 					rateLimited = true
+					reduceMu.Unlock()
+				}
+				if isWatchdogAbortError(reduceErr) {
+					reduceMu.Lock()
+					watchdogTripped = true
 					reduceMu.Unlock()
 				}
 			}
@@ -917,6 +944,10 @@ func (s *wikiIngestService) ProcessWikiIngest(ctx context.Context, t *asynq.Task
 	if rateLimited {
 		followUpDelay = wikiRateLimitBackoff
 		logger.Warnf(ctx, "wiki ingest: KB %s hit upstream rate limiting, backing off follow-up to %s", payload.KnowledgeBaseID, followUpDelay)
+	}
+	if watchdogTripped {
+		followUpDelay = wikiWatchdogBackoff
+		logger.Warnf(ctx, "wiki ingest: KB %s model watchdog tripped (hung call or hard auth/quota error): lane paused, queued jobs preserved and resume after %s", payload.KnowledgeBaseID, followUpDelay)
 	}
 	followCtx, followCancel := wikiIngestCleanupContext(ctx)
 	followUpScheduled = s.scheduleFollowUp(followCtx, payload, followUpDelay)
@@ -1877,6 +1908,7 @@ func (s *wikiIngestService) reduceSlugUpdates(
 		page.ChunkRefs = types.StringArray{}
 		changed = true
 
+		s.dropDeadSourceRefs(ctx, kbID, page)
 		if exists {
 			_, err = s.wikiService.UpdatePage(ctx, page)
 		} else {
@@ -2131,13 +2163,16 @@ func (s *wikiIngestService) reduceSlugUpdates(
 		// the rest of the row. Retract-only updates (no additions) preserve
 		// the existing refs; addition rounds append the newly-cited chunks
 		// on top of what was already there, deduplicated.
-		page.ChunkRefs = mergeChunkRefs(page.ChunkRefs, additions)
-		if exists {
-			_, err = s.wikiService.UpdatePage(ctx, page)
-		} else {
-			_, err = s.wikiService.CreatePage(ctx, page)
-		}
-		return true, affectedType, additionFailed, err
+			// Ingest/delete race, write half: the snapshot was taken before
+			// the reduce LLM call; re-verify dead refs at the write instant.
+			s.dropDeadSourceRefs(ctx, kbID, page)
+			page.ChunkRefs = mergeChunkRefs(page.ChunkRefs, additions)
+			if exists {
+				_, err = s.wikiService.UpdatePage(ctx, page)
+			} else {
+				_, err = s.wikiService.CreatePage(ctx, page)
+			}
+			return true, affectedType, additionFailed, err
 	}
 
 	return false, "", additionFailed, nil
